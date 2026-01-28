@@ -10,4 +10,6 @@ env/
 
 .cache/
 
+*.pkl
+
 tempCodeRunnerFile.py

@@ -1,28 +1,54 @@
-from fastapi import APIRouter, HTTPException
+import logging
+
+from fastapi import APIRouter, HTTPException, Request
+
 from schemas.models import AdRequest
+from services.moderation import prepare_features
+
 
 router = APIRouter()
 
-@router.post("/predict")
-async def predict(ad: AdRequest):
-    """
-    Принимает json с полями AdRequest и возвращает dict с ключом 'result' (bool).
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-    Прогнозирует, пройдет ли объявление модерацию.
-    Верифицированные продавцы всегда проходят.
-    Неверифицированные проходят только если у них есть фото.
-    Обрабатывает ошибки бизнес-логики и возвращает 500 в случае ошибок.
-    Возвращает 422 при ошибках валидации Pydantic."""
+
+@router.post("/predict")
+async def predict(ad: AdRequest, request: Request):
+
+    model = getattr(request.app.state, "model", None)
+
+    if model is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Модель не загружена",
+        )
+
     try:
-        if ad.images_qty < 0:
-            raise ValueError("images_qty не может быть отрицательным")
-        
-        if ad.is_verified_seller:
-            return {"result": True}
-        return {"result": ad.images_qty > 0}
-    
+        features = prepare_features(ad)
+
+        logger.info(
+            "Request: seller_id=%s, item_id=%s, features=%s",
+            ad.seller_id,
+            ad.item_id,
+            features.tolist(),
+        )
+
+        probability = float(model.predict_proba(features)[0][1])
+        is_violation = probability > 0.5
+
+        logger.info(
+            "Result: is_violation=%s, probability=%s",
+            is_violation,
+            probability,
+        )
+
+        return {
+            "is_violation": is_violation,
+            "probability": probability,
+        }
+
     except Exception as e:
         raise HTTPException(
-            status_code=500, 
-            detail=f"Internal server error: {str(e)}"
+            status_code=500,
+            detail=f"Internal server error: {str(e)}",
         )
