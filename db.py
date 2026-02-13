@@ -7,7 +7,7 @@ from contextlib import asynccontextmanager
 
 
 BASE_DIR = Path(__file__).resolve().parent
-PGMIGRATE_CONFIG_PATH = BASE_DIR / "migrations" / "pgmigrate.yml"
+PGMIGRATE_CONFIG_PATH = BASE_DIR / "pgmigrate.yml"
 
 _pool: Optional[asyncpg.pool.Pool] = None
 _pg_config: Optional[dict[str, Any]] = None
@@ -20,13 +20,13 @@ def _load_pg_config() -> dict[str, Any]:
         with PGMIGRATE_CONFIG_PATH.open("r", encoding="utf-8") as f:
             raw = yaml.safe_load(f)
 
-        conn_cfg = raw.get("connection", {})
+        conn_cfg = raw.get("connection") or raw.get("conn", {})
         _pg_config = {
-            "host": conn_cfg["host"],
-            "port": conn_cfg["port"],
-            "user": conn_cfg["username"],
-            "password": conn_cfg["password"],
-            "database": conn_cfg["database"],
+            "host": conn_cfg.get("host", "localhost"),
+            "port": conn_cfg.get("port", 5432),
+            "user": conn_cfg.get("username") or conn_cfg.get("user"),
+            "password": conn_cfg.get("password"),
+            "database": conn_cfg.get("database") or conn_cfg.get("dbname"),
         }
 
     return _pg_config

@@ -4,8 +4,16 @@ from fastapi import APIRouter, HTTPException, Request
 
 from db import get_connection
 from repositories.ads import AdRepository
+from repositories.moderation_results import ModerationResultRepository
 from repositories.users import UserRepository
-from schemas.models import AdRequest, PredictResponse, SimplePredictRequest
+from schemas.models import (
+    AdRequest,
+    AsyncPredictRequest,
+    AsyncPredictResponse,
+    ModerationStatusResponse,
+    PredictResponse,
+    SimplePredictRequest,
+)
 from services.moderation import prepare_features
 
 
@@ -110,3 +118,51 @@ async def simple_predict(payload: SimplePredictRequest, request: Request):
                 status_code=500,
                 detail=f"Internal server error: {str(e)}",
             )
+
+
+@router.post("/async_predict", response_model=AsyncPredictResponse)
+async def async_predict(payload: AsyncPredictRequest, request: Request):
+
+    # объявление существует
+    async with get_connection() as conn:
+        ad_repo = AdRepository(conn)
+        mod_repo = ModerationResultRepository(conn)
+
+        ad = await ad_repo.get(payload.item_id)
+        if ad is None:
+            raise HTTPException(status_code=404, detail="Объявление не найдено")
+
+        moderation_result = await mod_repo.create_pending(item_id=ad.id)
+
+    # отправляем задачу в Kafka
+    kafka_client = getattr(request.app.state, "kafka_client", None)
+    if kafka_client is None:
+        raise HTTPException(status_code=503, detail="Kafka producer недоступен")
+
+    await kafka_client.send_moderation_request(
+        item_id=moderation_result.item_id,
+        task_id=moderation_result.id,
+    )
+
+    return AsyncPredictResponse(
+        task_id=moderation_result.id,
+        status=moderation_result.status,
+        message="Moderation request accepted",
+    )
+
+
+@router.get("/moderation_result/{task_id}", response_model=ModerationStatusResponse)
+async def get_moderation_result(task_id: int):
+    async with get_connection() as conn:
+        repo = ModerationResultRepository(conn)
+        result = await repo.get(task_id)
+
+    if result is None:
+        raise HTTPException(status_code=404, detail="Задача модерации не найдена")
+
+    return ModerationStatusResponse(
+        task_id=result.id,
+        status=result.status,
+        is_violation=result.is_violation,
+        probability=result.probability,
+    )
