@@ -2,9 +2,11 @@ import logging
 
 from fastapi import APIRouter, HTTPException, Request
 
+from app.clients.redis import RedisClient
 from db import get_connection
 from repositories.ads import AdRepository
 from repositories.moderation_results import ModerationResultRepository
+from repositories.prediction_cache import PredictionCacheRepository
 from repositories.users import UserRepository
 from schemas.models import (
     AdRequest,
@@ -71,12 +73,20 @@ async def predict(ad: AdRequest, request: Request):
 
 @router.post("/simple_predict", response_model=PredictResponse)
 async def simple_predict(payload: SimplePredictRequest, request: Request):
+    redis_client = RedisClient.get_client()
+    cache_repo = PredictionCacheRepository(redis_client)
+
+    cached_result = await cache_repo.get_prediction(payload.item_id)
+    if cached_result:
+        logger.info("Cache hit for item_id=%s", payload.item_id)
+        return PredictResponse(**cached_result)
+
     model = _get_model_from_app(request)
 
     async with get_connection() as conn:
         ad_repo = AdRepository(conn)
         user_repo = UserRepository(conn)
-
+        
         ad = await ad_repo.get(payload.item_id)
         if ad is None:
             raise HTTPException(status_code=404, detail="Объявление не найдено")
@@ -97,21 +107,25 @@ async def simple_predict(payload: SimplePredictRequest, request: Request):
 
         try:
             features = prepare_features(ad_request)
-            probability = float(model.predict_proba(features)[0][1])
-            is_violation = probability > 0.5
+            probability_val = float(model.predict_proba(features)[0][1])
+            is_violation_val = probability_val > 0.5
+            
+            result_data = {
+                "is_violation": is_violation_val,
+                "probability": probability_val,
+            }
+
+            await cache_repo.set_prediction(payload.item_id, result_data)
 
             logger.info(
                 "Simple predict: item_id=%s, seller_id=%s, is_violation=%s, probability=%s",
                 ad.id,
                 user.id,
-                is_violation,
-                probability,
+                is_violation_val,
+                probability_val,
             )
 
-            return PredictResponse(
-                is_violation=is_violation,
-                probability=probability,
-            )
+            return PredictResponse(**result_data)
 
         except Exception as e:
             raise HTTPException(
@@ -160,9 +174,39 @@ async def get_moderation_result(task_id: int):
     if result is None:
         raise HTTPException(status_code=404, detail="Задача модерации не найдена")
 
+    if result.status == "completed":
+        redis_client = RedisClient.get_client()
+        cache_repo = PredictionCacheRepository(redis_client)
+        cached_data = {
+            "is_violation": result.is_violation,
+            "probability": result.probability
+        }
+        await cache_repo.set_prediction(result.item_id, cached_data)
+
     return ModerationStatusResponse(
         task_id=result.id,
         status=result.status,
         is_violation=result.is_violation,
         probability=result.probability,
     )
+
+
+@router.post("/close")
+async def close(item_id: int):
+    async with get_connection() as conn:
+        ad_repo = AdRepository(conn)
+        mod_repo = ModerationResultRepository(conn)
+
+        ad = await ad_repo.get(item_id)
+        if ad is None:
+             raise HTTPException(status_code=404, detail="Объявление не найдено")
+
+        await ad_repo.close(item_id)
+        
+        await mod_repo.delete_by_item_id(item_id)
+        
+    redis_client = RedisClient.get_client()
+    cache_repo = PredictionCacheRepository(redis_client)
+    await cache_repo.delete_prediction(item_id)
+    
+    return {"message": "Ad closed successfully"}

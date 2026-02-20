@@ -72,6 +72,15 @@ class ModerationResultRepository:
             return None
         return self._row_to_model(row)
 
+    async def delete_by_item_id(self, item_id: int) -> None:
+        await self._conn.execute(
+            """
+            DELETE FROM moderation_results
+            WHERE item_id = $1
+            """,
+            item_id,
+        )
+
     @staticmethod
     def _row_to_model(row: asyncpg.Record) -> ModerationResult:
         return ModerationResult(

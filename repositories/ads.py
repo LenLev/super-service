@@ -54,7 +54,7 @@ class AdRepository:
             """
             SELECT id, seller_id, title, description, category, images_qty
             FROM ads
-            WHERE id = $1
+            WHERE id = $1 AND is_closed = FALSE
             """,
             ad_id,
         )
@@ -68,6 +68,16 @@ class AdRepository:
             description=row["description"],
             category=row["category"],
             images_qty=row["images_qty"],
+        )
+
+    async def close(self, ad_id: int) -> None:
+        await self._conn.execute(
+            """
+            UPDATE ads
+            SET is_closed = TRUE
+            WHERE id = $1
+            """,
+            ad_id,
         )
 
 

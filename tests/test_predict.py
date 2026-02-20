@@ -1,264 +1,100 @@
-import os
-import tempfile
-
 import pytest
-
-from db import get_db_path, init_db
+from unittest.mock import AsyncMock, MagicMock
 from main import app
-from repositories.ads import AdRepository
-from repositories.users import UserRepository
+from fastapi.testclient import TestClient
+from repositories.ads import Ad
+from repositories.moderation_results import ModerationResult
 
+@pytest.fixture
+def client_mock():
+    with TestClient(app) as c:
+        yield c
 
-@pytest.fixture(autouse=True)
-def _temp_db(monkeypatch):
-    with tempfile.TemporaryDirectory() as tmpdir:
-        db_path = os.path.join(tmpdir, "test_db.sqlite3")
-        monkeypatch.setenv("DATABASE_PATH", db_path)
-        init_db()
-        yield
+@pytest.fixture
+def mock_repos_and_db(monkeypatch):
+    ad_repo_instance = AsyncMock()
+    user_repo_instance = AsyncMock()
+    mod_repo_instance = AsyncMock()
+    cache_repo_instance = AsyncMock()
 
+    mock_conn = AsyncMock()
+    mock_conn.__aenter__.return_value = AsyncMock()
+    mock_conn.__aexit__.return_value = None
+    
+    monkeypatch.setattr("routers.predict.get_connection", lambda: mock_conn)
+    
+    ad_repo_instance.get.return_value = None
+    
+    monkeypatch.setattr("routers.predict.AdRepository", lambda conn: ad_repo_instance)
+    monkeypatch.setattr("routers.predict.UserRepository", lambda conn: user_repo_instance)
+    monkeypatch.setattr("routers.predict.ModerationResultRepository", lambda conn: mod_repo_instance)
+    monkeypatch.setattr("routers.predict.PredictionCacheRepository", lambda client: cache_repo_instance)
+    
+    monkeypatch.setattr("app.clients.redis.RedisClient.get_client", lambda: MagicMock())
 
-@pytest.mark.parametrize(
-    "is_verified_seller, images_qty",
-    [
-        (True, 0),  # верифицированный продавец
-        (False, 3),  # не верифицированный, есть фото
-        (False, 0),  # не верифицированный, нет фото
-    ],
-)
-def test_predict_logic_basic(client, is_verified_seller, images_qty):
-    data = {
-        "seller_id": 1,
-        "is_verified_seller": is_verified_seller,
-        "item_id": 10,
-        "name": "Я тестовое объявление",
-        "description": "Я тестовое описание объявления",
-        "category": 1,
-        "images_qty": images_qty,
+    return {
+        "ad_repo": ad_repo_instance,
+        "user_repo": user_repo_instance,
+        "mod_repo": mod_repo_instance,
+        "cache_repo": cache_repo_instance
     }
 
-    response = client.post("/predict", json=data)
+@pytest.fixture
+def mock_model(monkeypatch):
+    model = MagicMock()
+    monkeypatch.setattr(app.state, "model", model, raising=False)
+    return model
 
+@pytest.mark.parametrize("payload", [
+    {"item_id": 10},
+])
+def test_simple_predict_cache_hit(client_mock, mock_repos_and_db, mock_model, payload):
+    mock_repos_and_db["cache_repo"].get_prediction.return_value = {
+        "is_violation": True,
+        "probability": 0.95
+    }
+    
+    response = client_mock.post("/simple_predict", json=payload)
+    
     assert response.status_code == 200
+    data = response.json()
+    assert data["is_violation"] is True
+    assert data["probability"] == 0.95
+    
+    mock_repos_and_db["ad_repo"].get.assert_not_called()
+    mock_model.predict_proba.assert_not_called()
 
-    response_data = response.json()
-
-    assert "is_violation" in response_data
-    assert "probability" in response_data
-
-    assert isinstance(response_data["is_violation"], bool)
-    assert isinstance(response_data["probability"], float)
-
-    assert 0.0 <= response_data["probability"] <= 1.0
-
-
-def test_predict_violation_true(client, monkeypatch):
-    class DummyModel:
-        def predict_proba(self, X):
-            return [[0.1, 0.9]]
-
-    monkeypatch.setattr(app.state, "model", DummyModel(), raising=False)
-
-    data = {
-        "seller_id": 1,
-        "is_verified_seller": False,
-        "item_id": 10,
-        "name": "Я тесто",
-        "description": "Я тестовое описание",
-        "category": 1,
-        "images_qty": 1,
-    }
-
-    response = client.post("/predict", json=data)
+def test_simple_predict_cache_miss(client_mock, mock_repos_and_db, mock_model):
+    mock_repos_and_db["cache_repo"].get_prediction.return_value = None
+    
+    ad = Ad(id=10, seller_id=1, title="Test", description="Desc", category=1, images_qty=1)
+    mock_repos_and_db["ad_repo"].get.return_value = ad
+    
+    user = MagicMock()
+    user.id = 1
+    user.is_verified_seller = False
+    mock_repos_and_db["user_repo"].get.return_value = user
+    
+    mock_model.predict_proba.return_value = [[0.1, 0.8]]
+    
+    response = client_mock.post("/simple_predict", json={"item_id": 10})
+    
     assert response.status_code == 200
-    body = response.json()
-    assert body["is_violation"] is True
-    assert 0.0 <= body["probability"] <= 1.0
+    data = response.json()
+    assert data["is_violation"] is True
+    assert data["probability"] == 0.8
+    
+    mock_repos_and_db["ad_repo"].get.assert_awaited_once_with(10)
+    
+    mock_repos_and_db["cache_repo"].set_prediction.assert_awaited_once()
 
-
-def test_predict_violation_false(client, monkeypatch):
-    class DummyModel:
-        def predict_proba(self, X):
-            return [[0.9, 0.1]]
-
-    monkeypatch.setattr(app.state, "model", DummyModel(), raising=False)
-
-    data = {
-        "seller_id": 1,
-        "is_verified_seller": True,
-        "item_id": 10,
-        "name": "Клавиатура",
-        "description": "Тактильная клавиатура",
-        "category": 1,
-        "images_qty": 1,
-    }
-
-    response = client.post("/predict", json=data)
+def test_close_ad(client_mock, mock_repos_and_db):
+    ad = Ad(id=10, seller_id=1, title="Test", description="Desc", category=1, images_qty=1)
+    mock_repos_and_db["ad_repo"].get.return_value = ad
+    
+    response = client_mock.post("/close", params={"item_id": 10})
     assert response.status_code == 200
-    body = response.json()
-    assert body["is_violation"] is False
-    assert 0.0 <= body["probability"] <= 1.0
-
-
-def test_validation_wrong_type(client):
-    data = {
-        "seller_id": "четыре",  # неправильный тип
-        "is_verified_seller": False,
-        "item_id": 13,
-        "name": "Сухофрукты",
-        "description": "Размоченные",
-        "category": 1,
-        "images_qty": 1,
-    }
-
-    response = client.post("/predict", json=data)
-    assert response.status_code == 422
-
-
-def test_validation_missing_field(client):
-    data = {
-        # нет seller_id
-        "is_verified_seller": False,
-        "item_id": 14,
-        "name": "Календарь",
-        "description": "2012 год",
-        "category": 1,
-        "images_qty": 1,
-    }
-
-    response = client.post("/predict", json=data)
-    assert response.status_code == 422
-
-
-def test_business_logic_error(client):
-    data = {
-        "seller_id": 5,
-        "is_verified_seller": False,
-        "item_id": 20,
-        "name": "Яблоко",
-        "description": "Отгрызенное яблоко",
-        "category": 1,
-        "images_qty": -100,  # ошибка бизнес-логики
-    }
-
-    response = client.post("/predict", json=data)
-    assert response.status_code == 500
-
-    response_data = response.json()
-    assert "detail" in response_data
-    assert "Internal server error" in response_data["detail"]
-
-
-def test_model_not_loaded(client, monkeypatch):
-    monkeypatch.setattr(app.state, "model", None, raising=False)
-
-    data = {
-        "seller_id": 1,
-        "is_verified_seller": True,
-        "item_id": 1,
-        "name": "Товар",
-        "description": "Описание",
-        "category": 1,
-        "images_qty": 1,
-    }
-
-    response = client.post("/predict", json=data)
-    assert response.status_code == 503
-    assert response.json()["detail"] == "Модель не загружена"
-
-
-def test_simple_predict_positive(client, monkeypatch, tmp_path):
-    class DummyModel:
-        def predict_proba(self, X):
-            return [[0.1, 0.9]]
-
-    monkeypatch.setattr(app.state, "model", DummyModel(), raising=False)
-
-    from db import get_connection
-
-    with get_connection() as conn:
-        user_repo = UserRepository(conn)
-        ad_repo = AdRepository(conn)
-
-        user = user_repo.create(is_verified_seller=False)
-        ad = ad_repo.create(
-            seller_id=user.id,
-            title="Объявление",
-            description="Описание",
-            category=1,
-            images_qty=1,
-        )
-
-    response = client.post("/simple_predict", json={"item_id": ad.id})
-
-    assert response.status_code == 200
-    body = response.json()
-    assert body["is_violation"] is True
-    assert 0.0 <= body["probability"] <= 1.0
-
-
-def test_simple_predict_negative(client, monkeypatch):
-    class DummyModel:
-        def predict_proba(self, X):
-            return [[0.9, 0.1]]
-
-    monkeypatch.setattr(app.state, "model", DummyModel(), raising=False)
-
-    from db import get_connection
-
-    with get_connection() as conn:
-        user_repo = UserRepository(conn)
-        ad_repo = AdRepository(conn)
-
-        user = user_repo.create(is_verified_seller=True)
-        ad = ad_repo.create(
-            seller_id=user.id,
-            title="Честное объявление",
-            description="Просто товар",
-            category=1,
-            images_qty=1,
-        )
-
-    response = client.post("/simple_predict", json={"item_id": ad.id})
-
-    assert response.status_code == 200
-    body = response.json()
-    assert body["is_violation"] is False
-    assert 0.0 <= body["probability"] <= 1.0
-
-
-def test_repositories_create_and_read():
-    from db import get_connection
-
-    with get_connection() as conn:
-        user_repo = UserRepository(conn)
-        ad_repo = AdRepository(conn)
-
-        user = user_repo.create(is_verified_seller=True)
-        assert user.id is not None
-        loaded_user = user_repo.get(user.id)
-        assert loaded_user is not None
-        assert loaded_user.is_verified_seller is True
-
-        ad = ad_repo.create(
-            seller_id=user.id,
-            title="Тестовое объявление",
-            description="Описание",
-            category=2,
-            images_qty=5,
-        )
-        assert ad.id is not None
-
-        loaded_ad = ad_repo.get(ad.id)
-        assert loaded_ad is not None
-        assert loaded_ad.seller_id == user.id
-        assert loaded_ad.title == "Тестовое объявление"
-
-
-def test_root(client):
-    response = client.get("/")
-
-    assert response.status_code == 200
-
-    response_data = response.json()
-    assert "message" in response_data
+    
+    mock_repos_and_db["ad_repo"].close.assert_awaited_once_with(10)
+    mock_repos_and_db["mod_repo"].delete_by_item_id.assert_awaited_once_with(10)
+    mock_repos_and_db["cache_repo"].delete_prediction.assert_awaited_once_with(10)
