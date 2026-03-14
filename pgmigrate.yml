@@ -1,9 +1,9 @@
 conn:
   host: localhost
-  port: 5432
+  port: 5435
   user: postgres
   password: postgres
-  dbname: super_service
+  dbname: hw
   sslmode: disable
 
 migrations_dir: migrations

@@ -1,6 +1,10 @@
 import logging
+from typing import Annotated
 
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Request
+
+from dependencies.auth import get_current_account
+from repositories.accounts import Account
 
 from app.clients.redis import RedisClient
 from db import get_connection
@@ -36,7 +40,11 @@ def _get_model_from_app(request: Request):
 
 
 @router.post("/predict", response_model=PredictResponse)
-async def predict(ad: AdRequest, request: Request):
+async def predict(
+    ad: AdRequest,
+    request: Request,
+    _current_account: Annotated[Account, Depends(get_current_account)],
+):
 
     model = _get_model_from_app(request)
 
@@ -67,12 +75,16 @@ async def predict(ad: AdRequest, request: Request):
     except Exception as e:
         raise HTTPException(
             status_code=500,
-            detail=f"Internal server error: {str(e)}",
+            detail=f"Внутренняя ошибка сервера: {str(e)}",
         )
 
 
 @router.post("/simple_predict", response_model=PredictResponse)
-async def simple_predict(payload: SimplePredictRequest, request: Request):
+async def simple_predict(
+    payload: SimplePredictRequest,
+    request: Request,
+    _current_account: Annotated[Account, Depends(get_current_account)],
+):
     redis_client = RedisClient.get_client()
     cache_repo = PredictionCacheRepository(redis_client)
 
@@ -130,14 +142,16 @@ async def simple_predict(payload: SimplePredictRequest, request: Request):
         except Exception as e:
             raise HTTPException(
                 status_code=500,
-                detail=f"Internal server error: {str(e)}",
+                detail=f"Внутренняя ошибка сервера: {str(e)}",
             )
 
 
 @router.post("/async_predict", response_model=AsyncPredictResponse)
-async def async_predict(payload: AsyncPredictRequest, request: Request):
-
-    # объявление существует
+async def async_predict(
+    payload: AsyncPredictRequest,
+    request: Request,
+    _current_account: Annotated[Account, Depends(get_current_account)],
+):
     async with get_connection() as conn:
         ad_repo = AdRepository(conn)
         mod_repo = ModerationResultRepository(conn)
@@ -148,10 +162,9 @@ async def async_predict(payload: AsyncPredictRequest, request: Request):
 
         moderation_result = await mod_repo.create_pending(item_id=ad.id)
 
-    # отправляем задачу в Kafka
     kafka_client = getattr(request.app.state, "kafka_client", None)
     if kafka_client is None:
-        raise HTTPException(status_code=503, detail="Kafka producer недоступен")
+        raise HTTPException(status_code=503, detail="Продюсер Kafka недоступен")
 
     await kafka_client.send_moderation_request(
         item_id=moderation_result.item_id,
@@ -161,12 +174,15 @@ async def async_predict(payload: AsyncPredictRequest, request: Request):
     return AsyncPredictResponse(
         task_id=moderation_result.id,
         status=moderation_result.status,
-        message="Moderation request accepted",
+        message="Запрос на модерацию принят",
     )
 
 
 @router.get("/moderation_result/{task_id}", response_model=ModerationStatusResponse)
-async def get_moderation_result(task_id: int):
+async def get_moderation_result(
+    task_id: int,
+    _current_account: Annotated[Account, Depends(get_current_account)],
+):
     async with get_connection() as conn:
         repo = ModerationResultRepository(conn)
         result = await repo.get(task_id)
@@ -192,7 +208,10 @@ async def get_moderation_result(task_id: int):
 
 
 @router.post("/close")
-async def close(item_id: int):
+async def close(
+    item_id: int,
+    _current_account: Annotated[Account, Depends(get_current_account)],
+):
     async with get_connection() as conn:
         ad_repo = AdRepository(conn)
         mod_repo = ModerationResultRepository(conn)
@@ -209,4 +228,4 @@ async def close(item_id: int):
     cache_repo = PredictionCacheRepository(redis_client)
     await cache_repo.delete_prediction(item_id)
     
-    return {"message": "Ad closed successfully"}
+    return {"message": "Объявление успешно закрыто"}

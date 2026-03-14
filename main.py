@@ -6,6 +6,7 @@ from app.clients.kafka import KafkaModerationClient
 from app.clients.redis import RedisClient
 from db import close_db, init_db
 from model import get_or_train_model
+from routers.auth import router as auth_router
 from routers.predict import router
 
 
@@ -22,7 +23,7 @@ async def lifespan(app: FastAPI):
     kafka_client = KafkaModerationClient()
     await kafka_client.start()
 
-    # Initialize Redis Client
+    # Инициализируем Redis-клиент
     redis_client = RedisClient.get_client()
     app.state.redis_client = redis_client
 
@@ -39,6 +40,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(lifespan=lifespan)
 app.include_router(router)
+app.include_router(auth_router)
 
 
 @app.get("/")

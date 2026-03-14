@@ -2,13 +2,22 @@ import pytest
 from unittest.mock import AsyncMock, MagicMock
 from main import app
 from fastapi.testclient import TestClient
+from dependencies.auth import get_current_account
+from repositories.accounts import Account
 from repositories.ads import Ad
 from repositories.moderation_results import ModerationResult
 
 @pytest.fixture
 def client_mock():
+    app.dependency_overrides[get_current_account] = lambda: Account(
+        id=1,
+        login="test",
+        password="secret",
+        is_blocked=False,
+    )
     with TestClient(app) as c:
         yield c
+    app.dependency_overrides.clear()
 
 @pytest.fixture
 def mock_repos_and_db(monkeypatch):

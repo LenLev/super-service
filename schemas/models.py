@@ -36,3 +36,13 @@ class ModerationStatusResponse(BaseModel):
     status: str
     is_violation: Optional[bool] = None
     probability: Optional[float] = None
+
+
+class LoginRequest(BaseModel):
+    login: str
+    password: str
+
+
+class LoginResponse(BaseModel):
+    access_token: str
+    token_type: str = "bearer"
